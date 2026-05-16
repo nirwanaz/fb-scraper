@@ -1,7 +1,12 @@
 // Global storage for intercepted posts
 let interceptedPosts = [];
-let discoveredGroups = [];
 
+// Load existing data from storage on init
+chrome.storage.local.get(['fb_intercepted_posts'], (result) => {
+  if (result.fb_intercepted_posts) {
+    interceptedPosts = result.fb_intercepted_posts;
+  }
+});
 
 // Inject the interception script
 function injectScript() {
@@ -20,6 +25,122 @@ function updateBadge(count) {
   if (chrome.runtime && chrome.runtime.sendMessage) {
     chrome.runtime.sendMessage({ type: 'UPDATE_BADGE', count: count }).catch(() => {});
   }
+}
+
+// --- Lexical Editor Helpers for Auto Comment ---
+
+/**
+ * Insert text into Facebook's Lexical Editor using execCommand.
+ * 
+ * KEY INSIGHT: Lexical listens to trusted 'beforeinput' events.
+ * document.execCommand('insertText') is the ONLY way to generate
+ * trusted beforeinput events from a content script.
+ * Direct DOM manipulation breaks Lexical's internal state.
+ */
+async function insertTextIntoLexical(editor, text) {
+  editor.focus();
+  await new Promise(r => setTimeout(r, 500));
+
+  // Step 1: Select all existing content and delete it
+  document.execCommand('selectAll', false, null);
+  document.execCommand('delete', false, null);
+  await new Promise(r => setTimeout(r, 200));
+  
+  // Step 2: Insert text via execCommand (generates trusted events)
+  const inserted = document.execCommand('insertText', false, text);
+  console.log('[FB Scraper] execCommand insertText result:', inserted);
+  
+  await new Promise(r => setTimeout(r, 500));
+  
+  // Step 3: Verify
+  const content = (editor.innerText || editor.textContent || '').trim();
+  console.log('[FB Scraper] Editor content after insert:', content.substring(0, 80));
+  
+  if (content.length === 0) {
+    console.warn('[FB Scraper] execCommand failed, trying clipboard paste...');
+    
+    // Fallback: Simulate paste via DataTransfer
+    editor.focus();
+    const dt = new DataTransfer();
+    dt.setData('text/plain', text);
+    const pasteEvent = new ClipboardEvent('paste', {
+      bubbles: true,
+      cancelable: true,
+      clipboardData: dt
+    });
+    editor.dispatchEvent(pasteEvent);
+    
+    await new Promise(r => setTimeout(r, 500));
+    const content2 = (editor.innerText || editor.textContent || '').trim();
+    console.log('[FB Scraper] Editor content after paste:', content2.substring(0, 80));
+    
+    if (content2.length === 0) {
+      console.warn('[FB Scraper] Paste also failed, trying direct DOM + input event...');
+      
+      // Last resort: Direct DOM manipulation
+      let p = editor.querySelector('p');
+      if (p) {
+        p.textContent = text;
+      } else {
+        editor.textContent = text;
+      }
+      
+      // Dispatch input events
+      editor.dispatchEvent(new InputEvent('input', {
+        bubbles: true, inputType: 'insertText', data: text
+      }));
+    }
+  }
+  
+  return content.length > 0;
+}
+
+/**
+ * Press Enter to send a comment in Facebook's Lexical Editor.
+ * Uses page-context script injection to interact with the editor.
+ * Also tries dispatching events directly as fallback.
+ */
+async function pressEnterToSend(editor) {
+  editor.focus();
+  await new Promise(r => setTimeout(r, 200));
+  
+  // Approach 1: Use execCommand insertParagraph — this triggers 
+  // a trusted beforeinput event with inputType 'insertParagraph'
+  // which Lexical's comment plugin interprets as "submit comment"
+  // (Facebook overrides paragraph insertion to mean "send")
+  
+  // But first, try direct keyboard events from page context
+  try {
+    const script = document.createElement('script');
+    script.textContent = `
+      (function() {
+        const el = document.querySelector('div[contenteditable="true"][data-lexical-editor="true"]:focus, div[contenteditable="true"][role="textbox"]:focus');
+        if (el) {
+          el.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}));
+          el.dispatchEvent(new KeyboardEvent('keypress', {key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}));
+          el.dispatchEvent(new KeyboardEvent('keyup', {key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}));
+        }
+      })();
+    `;
+    (document.head || document.documentElement).appendChild(script);
+    script.remove();
+    console.log('[FB Scraper] Enter key dispatched via page-context injection.');
+  } catch (e) {
+    console.warn('[FB Scraper] Page injection failed:', e.message);
+  }
+  
+  await new Promise(r => setTimeout(r, 500));
+  
+  // Approach 2: Also dispatch directly from content script
+  const eventOpts = {
+    key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+    bubbles: true, cancelable: true
+  };
+  editor.dispatchEvent(new KeyboardEvent('keydown', eventOpts));
+  editor.dispatchEvent(new KeyboardEvent('keypress', eventOpts));
+  editor.dispatchEvent(new KeyboardEvent('keyup', eventOpts));
+  
+  console.log('[FB Scraper] Enter key also dispatched from content script.');
 }
 
 // Deep Scrape State
@@ -60,49 +181,95 @@ function startDeepAutoClicker() {
   
   console.log(`[FB Scraper] Running Auto-Clicker Loop. Clicks: ${deepScrapeClickCount}, Retries: ${deepScrapeEmptyRetries}`);
 
-  // 1. Robust Scrolling
+  // 1. Smarter Scrolling (Find the actual scroll container)
   const dialog = document.querySelector('[role="dialog"]');
   if (dialog) {
-    console.log('[FB Scraper] Scrolling dialog...');
-    dialog.scrollTop += 800;
+    // Find the child element that actually has the scrollbar
+    const scrollableElement = Array.from(dialog.querySelectorAll('*')).find(el => {
+      const style = window.getComputedStyle(el);
+      return (el.scrollHeight > el.clientHeight) && (style.overflowY === 'auto' || style.overflowY === 'scroll');
+    });
+    
+    const target = scrollableElement || dialog;
+    console.log('[FB Scraper] Scrolling container...');
+    target.scrollTop = target.scrollHeight; // Scroll to absolute bottom
   } else {
-    window.scrollBy(0, 800);
-    document.documentElement.scrollTop += 800;
+    window.scrollTo(0, document.body.scrollHeight);
   }
 
-  // 2. Find "View more comments" buttons
-  const keywords = ['view more', 'lihat komentar', 'lihat balasan', 'see more', 'tampilkan', 'sebelumnya', 'previous', 'lainnya'];
+  // 2. Handle "Most Relevant" dropdown (Improved with Polling)
+  if (deepScrapeClickCount < 3) {
+    const filterButton = Array.from(document.querySelectorAll('[role="button"]')).find(btn => {
+      const text = (btn.innerText || '').toLowerCase();
+      return text.includes('paling relevan') || text.includes('most relevant') || text.includes('terkait');
+    });
+
+    if (filterButton && filterButton.getAttribute('aria-expanded') !== 'true') {
+      console.log('[FB Scraper] Found relevance filter. Opening menu...');
+      filterButton.click();
+      
+      let menuAttempts = 0;
+      const menuInterval = setInterval(() => {
+        const menuItems = Array.from(document.querySelectorAll('[role="menuitem"], [role="option"], [role="button"]'));
+        const allCommentsOption = menuItems.find(item => {
+          const text = (item.innerText || '').toLowerCase();
+          return text.includes('all comments') || text.includes('semua komentar') || text.includes('terbaru') || text.includes('newest') || text.includes('oldest');
+        });
+
+        if (allCommentsOption) {
+          console.log('[FB Scraper] Selecting "All Comments" option');
+          allCommentsOption.click();
+          clearInterval(menuInterval);
+        }
+        if (++menuAttempts > 15) clearInterval(menuInterval);
+      }, 300);
+    }
+  }
+
+  // 3. Find "View more comments/replies" buttons
+  const keywords = [
+    'view more', 'lihat komentar', 'lihat balasan', 'see more', 'tampilkan', 
+    'sebelumnya', 'previous', 'lainnya', 'replies', 'balasan', 'more comments'
+  ];
   
-  // Back to basics: look for role="button" containing keywords
   const buttons = Array.from(document.querySelectorAll('[role="button"]')).filter(btn => {
     const text = (btn.innerText || '').toLowerCase().trim();
-    if (!text) return false;
+    const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
     
-    const isMatch = keywords.some(kw => text.includes(kw));
-    const isExcluded = text.includes('share') || text.includes('bagikan');
+    if (!text && !ariaLabel) return false;
     
-    return isMatch && !isExcluded;
+    const isMatch = keywords.some(kw => text.includes(kw) || ariaLabel.includes(kw));
+    const hasNumbers = /\d+/.test(text) || /\d+/.test(ariaLabel);
+    
+    const isExcluded = text.includes('share') || text.includes('bagikan') || 
+                       text.includes('like') || text.includes('suka') ||
+                       text.includes('paling relevan') || text.includes('most relevant');
+    
+    return (isMatch || (hasNumbers && (text.includes('reply') || text.includes('balasan')))) && !isExcluded;
   });
 
   console.log(`[FB Scraper] Found ${buttons.length} potential load-more buttons.`);
 
   if (buttons.length > 0 && deepScrapeClickCount < MAX_DEEP_CLICKS) {
     deepScrapeClickCount++;
-    deepScrapeEmptyRetries = 0; // Reset retries since we found a button
+    deepScrapeEmptyRetries = 0; 
     
-    const targetButton = buttons[0];
-    console.log(`[FB Scraper] Clicking button: "${targetButton.innerText.substring(0, 40)}..."`);
-    targetButton.click();
+    // Pick the last button (often the most bottom "view more" or "replies")
+    const targetButton = buttons[buttons.length - 1];
+    console.log(`[FB Scraper] Clicking button: "${(targetButton.innerText || targetButton.getAttribute('aria-label') || 'unnamed').substring(0, 40)}..."`);
     
-    // Random delay between 2-5 seconds
-    const delay = Math.floor(Math.random() * 3000) + 2000;
-    setTimeout(startDeepAutoClicker, delay);
+    targetButton.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    
+    setTimeout(() => {
+      targetButton.click();
+      const delay = Math.floor(Math.random() * 1500) + 2000; // 2s - 3.5s
+      setTimeout(startDeepAutoClicker, delay);
+    }, 800);
   } else {
-    // If no buttons found, it might still be loading or we reached the end
     deepScrapeEmptyRetries++;
     if (deepScrapeEmptyRetries <= MAX_EMPTY_RETRIES) {
-      console.log(`[FB Scraper] No buttons found. Retrying in 2s... (${deepScrapeEmptyRetries}/${MAX_EMPTY_RETRIES})`);
-      setTimeout(startDeepAutoClicker, 2000);
+      console.log(`[FB Scraper] No buttons found. Retrying in 2.5s... (${deepScrapeEmptyRetries}/${MAX_EMPTY_RETRIES})`);
+      setTimeout(startDeepAutoClicker, 2500);
     } else {
       console.log('[FB Scraper] Deep Scrape Completed (Limit or End reached).');
       isDeepScraping = false;
@@ -157,11 +324,14 @@ window.addEventListener('message', (event) => {
 
   // --- Deep Scrape Interception ---
   if (isDeepScraping && deepScrapeFbid) {
-    let newCommentsText = [];
+    let newComments = []; 
     function findCommentsDeep(obj) {
       if (!obj || typeof obj !== 'object') return;
       if (obj.__typename === 'Comment' && obj.body && obj.body.text) {
-        newCommentsText.push(obj.body.text);
+        newComments.push({
+          text: obj.body.text.trim(),
+          id: obj.id || obj.legacy_fbid
+        });
       }
       for (const k in obj) {
         if (Array.isArray(obj[k])) {
@@ -173,31 +343,46 @@ window.addEventListener('message', (event) => {
     }
     findCommentsDeep(rawData);
     
-    if (newCommentsText.length > 0) {
-      console.log('[FB Scraper] Intercepted comments:', newCommentsText.length);
+    if (newComments.length > 0) {
       chrome.storage.local.get(['fb_intercepted_posts'], (result) => {
         let posts = result.fb_intercepted_posts || [];
-        // Robust comparison: convert both to String
         let postIndex = posts.findIndex(p => String(p.fbid) === String(deepScrapeFbid));
         
         if (postIndex !== -1) {
-          const appendedText = newCommentsText.join(' | ');
-          const currentText = posts[postIndex].commentsText || '';
+          let currentText = posts[postIndex].commentsText || '';
+          let addedCount = 0;
           
-          // Only append if not already there (rudimentary deduplication)
-          if (!currentText.includes(newCommentsText[0].substring(0, 20))) {
-            posts[postIndex].commentsText = currentText + ' | ' + appendedText;
-            posts[postIndex].commentsText = posts[postIndex].commentsText.substring(0, 25000); // Increased limit
-            chrome.storage.local.set({ fb_intercepted_posts: posts }, () => {
-              console.log('[FB Scraper] Storage updated with new comments.');
+          newComments.forEach(nc => {
+            // Better check: don't add if the exact text is already there
+            // We use a slightly more robust check than just .includes
+            const cleanText = nc.text;
+            if (cleanText && !currentText.includes(cleanText)) {
+              currentText += (currentText ? ' | ' : '') + cleanText;
+              addedCount++;
+            }
+          });
+          
+          if (addedCount > 0) {
+            posts[postIndex].commentsText = currentText.substring(0, 50000); 
+            posts[postIndex].lastUpdated = new Date().toISOString();
+            
+            chrome.storage.local.get(['fb_discovered_groups'], (groupsResult) => {
+              chrome.storage.local.set({ fb_intercepted_posts: posts }, () => {
+                console.log(`[FB Scraper] Deep Scrape: Added ${addedCount} new comments.`);
+                
+                // Notify popup of the update
+                chrome.runtime.sendMessage({ 
+                  type: 'DATA_UPDATED', 
+                  posts: posts,
+                  groups: groupsResult.fb_discovered_groups || []
+                }).catch(() => {});
+              });
             });
           }
-        } else {
-          console.warn('[FB Scraper] Could not find post in storage with FBID:', deepScrapeFbid);
         }
       });
     }
-    return; // Don't process as a feed if we are deep scraping
+    return; 
   }
   // --- End Deep Scrape Interception ---
 
@@ -229,46 +414,23 @@ window.addEventListener('message', (event) => {
           console.log(`%c 🔄 Post Stats Updated: ${post.author}`, 'color: #0ea5e9; font-style: italic;');
         }
       }
-
-      // Live Discovery: also add group to discoveredGroups if not already there
-      if (post.groupId && post.groupName && !discoveredGroups.find(g => g.id === post.groupId)) {
-        discoveredGroups.push({
-          id: post.groupId,
-          name: post.groupName,
-          url: `https://www.facebook.com/groups/${post.groupId}/`,
-          memberCount: 0,
-          postsPerDay: 0,
-          score: '⭐ Linked from Post',
-          scoreColor: '#3b82f6',
-          discoveredAt: new Date().toISOString()
-        });
-        newFound = true;
-        console.log(`%c 🔍 Group Discovered from Post: ${post.groupName}`, 'color: #3b82f6; font-weight: bold;');
-      }
-    });
-  }
-
-  if (groups && groups.length > 0) {
-    groups.forEach(group => {
-      if (!discoveredGroups.find(g => g.id === group.id)) {
-        discoveredGroups.push(group);
-        newFound = true;
-        console.log(`%c 🔍 Group Discovered: ${group.name}`, 'color: #22c55e; font-weight: bold;');
-      }
     });
   }
 
   if (newFound) {
+    if (!chrome.runtime || !chrome.runtime.id) {
+      console.warn('[FB Scraper] Extension context invalidated. Please refresh the page.');
+      return;
+    }
+
     chrome.storage.local.set({ 
-      fb_intercepted_posts: interceptedPosts,
-      fb_discovered_groups: discoveredGroups
+      fb_intercepted_posts: interceptedPosts
     });
-    updateBadge(interceptedPosts.length + discoveredGroups.length);
+    updateBadge(interceptedPosts.length);
 
     chrome.runtime.sendMessage({ 
       type: 'DATA_UPDATED', 
-      posts: interceptedPosts,
-      groups: discoveredGroups
+      posts: interceptedPosts
     }).catch(() => {});
   }
 });
@@ -277,6 +439,144 @@ window.addEventListener('message', (event) => {
 
 // Listener for popup messages
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === 'PERFORM_COMMENT') {
+    (async () => {
+      try {
+        console.log(`[FB Scraper] Attempting to perform auto-${msg.isReplyMode ? 'reply' : 'comment'}...`);
+        
+        if (msg.isReplyMode && msg.keywords) {
+          // --- AUTO REPLY LOGIC ---
+          const keywords = msg.keywords.map(k => k.toLowerCase());
+          const commentElements = Array.from(document.querySelectorAll('[role="article"][aria-label^="Comment by"]'));
+          
+          let repliesCount = 0;
+          for (const el of commentElements) {
+            const text = (el.innerText || '').toLowerCase();
+            const hasKeyword = keywords.some(k => text.includes(k));
+            
+            if (hasKeyword) {
+              // Find "Reply" button
+              const replyBtn = Array.from(el.querySelectorAll('[role="button"]')).find(b => {
+                const t = (b.innerText || '').toLowerCase().trim();
+                return t === 'reply' || t === 'balas' || t === 'jawab' || t === 'balasan';
+              });
+              
+              if (replyBtn) {
+                replyBtn.click();
+                await new Promise(r => setTimeout(r, 2500));
+                
+                // Find the Lexical reply editor that appeared
+                let replyBox = el.querySelector('div[contenteditable="true"][data-lexical-editor="true"]');
+                if (!replyBox) {
+                  replyBox = el.querySelector('div[contenteditable="true"][role="textbox"]');
+                }
+                if (!replyBox) {
+                  // Check active element
+                  const active = document.activeElement;
+                  if (active && (active.getAttribute('contenteditable') === 'true' || active.getAttribute('role') === 'textbox')) {
+                    replyBox = active;
+                  }
+                }
+
+                if (replyBox) {
+                  // Insert text using Lexical-compatible method
+                  await insertTextIntoLexical(replyBox, msg.message);
+                  await new Promise(r => setTimeout(r, 1000));
+                  
+                  // Send via Enter key (Facebook has no Send button)
+                  pressEnterToSend(replyBox);
+                  repliesCount++;
+                  await new Promise(r => setTimeout(r, 2500));
+                }
+              }
+            }
+          }
+          
+          sendResponse({ success: true, note: `Replied to ${repliesCount} matching comments` });
+          return;
+        }
+
+        // --- STANDARD AUTO COMMENT LOGIC ---
+        
+        // Step 1: Find Lexical comment editor
+        let commentBox = document.querySelector('div[contenteditable="true"][data-lexical-editor="true"]');
+        
+        if (!commentBox) {
+          commentBox = document.querySelector('div[contenteditable="true"][role="textbox"]');
+        }
+
+        // Step 2: If not found, click "Leave a comment" button to activate it
+        if (!commentBox) {
+          console.log('[FB Scraper] Comment box not visible, clicking Leave a comment...');
+          const leaveCommentBtn = document.querySelector('div[aria-label="Leave a comment"][role="button"]');
+          if (leaveCommentBtn) {
+            leaveCommentBtn.click();
+            await new Promise(r => setTimeout(r, 2500));
+            commentBox = document.querySelector('div[contenteditable="true"][data-lexical-editor="true"]');
+            if (!commentBox) {
+              commentBox = document.querySelector('div[contenteditable="true"][role="textbox"]');
+            }
+          }
+        }
+
+        // Step 3: Try aria-label pattern
+        if (!commentBox) {
+          console.log('[FB Scraper] Trying aria-label selectors...');
+          commentBox = document.querySelector('div[aria-label^="Comment as"][contenteditable="true"]');
+          if (!commentBox) {
+            commentBox = document.querySelector('div[aria-label*="comment"][contenteditable="true"]');
+          }
+          if (!commentBox) {
+            commentBox = document.querySelector('div[aria-label*="komentar"][contenteditable="true"]');
+          }
+        }
+
+        // Step 4: Last resort — any visible contenteditable
+        if (!commentBox) {
+          console.log('[FB Scraper] Last resort: searching any visible contenteditable...');
+          commentBox = Array.from(document.querySelectorAll('div[contenteditable="true"]')).find(el => {
+            return el.offsetParent !== null && el.getAttribute('data-lexical-editor') === 'true';
+          });
+          if (!commentBox) {
+            commentBox = Array.from(document.querySelectorAll('div[contenteditable="true"][role="textbox"]')).find(el => el.offsetParent !== null);
+          }
+        }
+
+        if (!commentBox) {
+          sendResponse({ success: false, error: 'Lexical comment editor not found after all attempts' });
+          return;
+        }
+
+        console.log('[FB Scraper] Found comment box:', commentBox.getAttribute('aria-label') || 'no label');
+
+        // Step 5: Insert text using Lexical-compatible method
+        await insertTextIntoLexical(commentBox, msg.message);
+        await new Promise(r => setTimeout(r, 1500));
+
+        // Step 6: Verify text was inserted
+        const currentText = (commentBox.innerText || commentBox.textContent || '').trim();
+        if (currentText.length === 0) {
+          console.warn('[FB Scraper] First insertion failed, retrying with execCommand...');
+          commentBox.focus();
+          document.execCommand('selectAll', false, null);
+          document.execCommand('insertText', false, msg.message);
+          await new Promise(r => setTimeout(r, 1000));
+        }
+
+        // Step 7: Send via Enter (Facebook has NO send button for comments)
+        console.log('[FB Scraper] Sending comment via Enter key...');
+        pressEnterToSend(commentBox);
+        await new Promise(r => setTimeout(r, 2500));
+        
+        sendResponse({ success: true, note: 'Sent via Enter key (Lexical editor)' });
+
+      } catch (err) {
+        sendResponse({ success: false, error: err.message });
+      }
+    })();
+    return true; // Keep channel open
+  }
+
   if (msg.type === 'START_SCRAPE') {
     const targetLimit = msg.targetLimit || null;
     autoScroll(targetLimit, (result) => {
@@ -366,128 +666,16 @@ function extractGroupDiscovery(node) {
     const name = node.name;
     const url = node.url || `https://www.facebook.com/groups/${id}`;
     
-    // Extract metadata (members and activity)
-    let memberCount = 0;
-    let postsPerDay = 0;
-    
-    // Helper to find strings in nested objects
-    function findMetadataStrings(obj, results = []) {
-      if (!obj || typeof obj !== 'object') return results;
-      if (typeof obj.text === 'string') results.push(obj.text);
-      if (typeof obj === 'string') results.push(obj);
-      
-      for (const key in obj) {
-        findMetadataStrings(obj[key], results);
-      }
-      return results;
-    }
-
-    const allStrings = findMetadataStrings(node);
-    
-    // Improved Number Extractor to handle decimals and localized separators
-    function extractNumber(text) {
-      const lowerText = text.toLowerCase();
-      const match = lowerText.match(/([\d,\.]+)/);
-      if (!match) return 0;
-      
-      let numStr = match[1];
-      // If the text contains multipliers, treat the punctuation as a decimal (e.g., "1,5 jt")
-      if (lowerText.match(/\b(rb|k|jt|m)\b/)) {
-        numStr = numStr.replace(',', '.');
-        let count = parseFloat(numStr) || 0;
-        if (lowerText.includes('rb') || lowerText.includes('k')) count *= 1000;
-        if (lowerText.includes('jt') || lowerText.includes('m')) count *= 1000000;
-        return count;
-      } else {
-        // Normal large number (e.g., "1.500" or "1,500"), remove punctuation
-        numStr = numStr.replace(/[,.]/g, '');
-        return parseInt(numStr, 10) || 0;
-      }
-    }
-    
-    allStrings.forEach(text => {
-      const lowerText = text.toLowerCase();
-      
-      // Member extraction (e.g., "1,5 jt anggota", "1.5M members")
-      if (lowerText.includes('member') || lowerText.includes('anggota')) {
-        const count = extractNumber(text);
-        if (count > 0) memberCount = Math.max(memberCount, count);
-      }
-      
-      // Post activity extraction (e.g., "10+ postingan sehari", "5 kiriman hari ini")
-      const isActivity = lowerText.includes('post') || lowerText.includes('kiriman') || lowerText.includes('tulisan');
-      const isDaily = lowerText.includes('sehari') || lowerText.includes('hari ini') || lowerText.includes('a day') || lowerText.includes('today');
-      
-      // Sometimes Facebook just says "10+ posts a day"
-      if (isActivity && !lowerText.includes('member')) {
-        // If it specifically mentions daily or just generally talks about posts
-        if (isDaily || lowerText.match(/\d+\+?\s*(post|kiriman)/)) {
-           const count = extractNumber(text);
-           if (count > 0) postsPerDay = Math.max(postsPerDay, count);
-        }
-      }
-    });
-
-    // Advanced Scoring System (Point-based)
-    let scorePoints = 0;
-    
-    // 1. Buying Intent in Name
-    const intentKeywords = ['racun', 'promo', 'diskon', 'jual', 'beli', 'murah', 'review', 'spill', 'rekomendasi', 'shopee', 'tokopedia', 'tiktok'];
-    const lowerName = name.toLowerCase();
-    if (intentKeywords.some(kw => lowerName.includes(kw))) {
-      scorePoints += 30; // High buying intent
-    }
-
-    // 2. Public vs Private Check
-    let isPublic = false;
-    allStrings.forEach(text => {
-      const lowerText = text.toLowerCase();
-      if (lowerText.includes('publik') || lowerText.includes('public group')) isPublic = true;
-    });
-    if (isPublic) {
-      scorePoints += 20; // Public groups are easier for affiliate sharing
-    }
-
-    // 3. Member Count Tiers
-    if (memberCount >= 100000) scorePoints += 30;
-    else if (memberCount >= 50000) scorePoints += 20;
-    else if (memberCount >= 10000) scorePoints += 10;
-    else if (memberCount >= 1000) scorePoints += 5;
-
-    // 4. Activity Rate (Posts per day)
-    if (postsPerDay >= 20) scorePoints += 30;
-    else if (postsPerDay >= 10) scorePoints += 20;
-    else if (postsPerDay >= 5) scorePoints += 10;
-    else if (postsPerDay >= 1) scorePoints += 5;
-
-    // Determine Final Grade
-    let score = 'Low';
-    let scoreColor = '#94a3b8';
-    
-    if (scorePoints >= 70) {
-      score = '🔥 Viral Potential';
-      scoreColor = '#22c55e';
-    } else if (scorePoints >= 40) {
-      score = '⭐ Medium Potential';
-      scoreColor = '#eab308';
-    } else {
-      score = '💤 Low Potential';
-      scoreColor = '#94a3b8';
-    }
-
-    const discovery = {
+    return {
       id,
       name,
       url,
-      memberCount,
-      postsPerDay,
-      score,
-      scoreColor,
+      memberCount: 0,
+      postsPerDay: 0,
+      score: 'Discovery',
+      scoreColor: '#94a3b8',
       discoveredAt: new Date().toISOString()
     };
-
-    console.log(`%c 🔍 Group Discovered: ${name}`, 'color: #22c55e; font-weight: bold;', discovery);
-    return discovery;
   } catch (e) {
     return null;
   }
@@ -647,9 +835,9 @@ function extractPostFromStory(story) {
       postUrl = `https://www.facebook.com/${fbid}`;
     }
 
-    // Filter: Only keep posts that have engagement (likes OR comments)
-    // The user requested: "hanya menampilkan data yang memiliki jumlah like dan komentar"
-    if (likes === 0 && comments === 0) {
+    // Filter: Only keep posts that have more than 1 interaction (likes + comments + shares)
+    const totalEngagement = likes + comments + shares;
+    if (totalEngagement <= 1) {
       return null;
     }
 
@@ -676,7 +864,8 @@ function extractPostFromStory(story) {
 
 function autoScroll(targetLimit, callback) {
   let scrollAttempts = 0;
-  let maxAttempts = targetLimit ? 30 : 5; // allow more time if waiting for a big limit
+  // Increase default depth to capture more posts
+  let maxAttempts = targetLimit ? Math.max(30, Math.ceil(targetLimit / 2)) : 15; 
   let initialPosts = interceptedPosts.length;
 
   const interval = setInterval(() => {

@@ -3,34 +3,86 @@ const exportBtn = document.getElementById('exportBtn');
 const clearBtn = document.getElementById('clearBtn');
 const status = document.getElementById('status');
 const results = document.getElementById('results');
-const groupResults = document.getElementById('group-results');
 const countBadge = document.getElementById('countBadge');
 const tabBtns = document.querySelectorAll('.tab-btn');
 const tabContents = document.querySelectorAll('.tab-content');
 const filterInput = document.getElementById('filterInput');
 const sortSelect = document.getElementById('sortSelect');
-const exportGroupsBtn = document.getElementById('exportGroupsBtn');
-
 let currentPosts = [];
-let currentGroups = [];
+let selectedPosts = new Set(); // Track FBIDs of selected posts
+let autoCommentLog = [];
+let isAutoCommenting = false;
 let activeFilter = '';
 let activeSort = 'newest';
 
 // Initialize
 document.addEventListener('DOMContentLoaded', async () => {
   // Load from storage
-  chrome.storage.local.get(['fb_intercepted_posts', 'fb_discovered_groups'], (result) => {
+  chrome.storage.local.get(['fb_intercepted_posts', 'fb_auto_comment_log'], (result) => {
     if (result.fb_intercepted_posts) currentPosts = result.fb_intercepted_posts;
-    if (result.fb_discovered_groups) currentGroups = result.fb_discovered_groups;
+    if (result.fb_auto_comment_log) autoCommentLog = result.fb_auto_comment_log;
     updateUI();
   });
 
-  // Listen for real-time updates
+  // Listen for real-time updates (via messaging)
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg.type === 'DATA_UPDATED') {
       currentPosts = msg.posts;
       currentGroups = msg.groups;
       updateUI();
+      
+      // Update live progress on the scraping button
+      const activeBtn = document.querySelector('[id^="active-scraping-"]');
+      if (activeBtn) {
+        const fbid = activeBtn.id.replace('active-scraping-', '');
+        const post = currentPosts.find(p => String(p.fbid) === String(fbid));
+        if (post && post.commentsText) {
+          const count = post.commentsText.split('|').length;
+          activeBtn.innerText = `Scraping: ${count} comments...`;
+        }
+      }
+    }
+
+    if (msg.type === 'DEEP_SCRAPE_COMPLETE') {
+      const activeBtn = document.querySelector('[id^="active-scraping-"]');
+      if (activeBtn) {
+        activeBtn.innerText = 'Done! Click Analyze';
+        activeBtn.style.background = '#3b82f6';
+        activeBtn.disabled = false;
+        activeBtn.removeAttribute('id');
+      }
+    }
+    
+    if (msg.type === 'AUTO_COMMENT_PROGRESS') {
+      updateCommentLog(msg.log);
+      document.getElementById('commentStatus').innerText = msg.status;
+      
+      const startBtn = document.getElementById('startAutoCommentBtn');
+      const stopBtn = document.getElementById('stopAutoCommentBtn');
+      
+      if (msg.status === 'Completed' || msg.status === 'Cancelled' || msg.status === 'Idle') {
+        if (startBtn) startBtn.style.display = 'flex';
+        if (stopBtn) stopBtn.style.display = 'none';
+      } else {
+        if (startBtn) startBtn.style.display = 'none';
+        if (stopBtn) stopBtn.style.display = 'flex';
+      }
+    }
+  });
+
+  // Listen for storage changes (handles updates from background tabs/scripts)
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local') {
+      let changed = false;
+      if (changes.fb_intercepted_posts) {
+        currentPosts = changes.fb_intercepted_posts.newValue || [];
+        changed = true;
+      }
+      if (changes.fb_intercepted_posts) {
+        currentPosts = changes.fb_intercepted_posts.newValue || [];
+        changed = true;
+      }
+      if (changed) updateUI();
     }
   });
 
@@ -54,101 +106,220 @@ document.addEventListener('DOMContentLoaded', async () => {
     activeSort = e.target.value;
     displayPosts(currentPosts);
   });
+
+  // Select All logic
+  const selectAllPosts = document.getElementById('selectAllPosts');
+  if (selectAllPosts) {
+    selectAllPosts.addEventListener('change', (e) => {
+      if (e.target.checked) {
+        currentPosts.forEach(p => selectedPosts.add(String(p.fbid)));
+      } else {
+        selectedPosts.clear();
+      }
+      displayPosts(currentPosts);
+      updateStartButton();
+    });
+  }
 });
 
-function updateUI() {
-  countBadge.innerText = currentPosts.length + currentGroups.length;
-  exportBtn.disabled = currentPosts.length === 0;
-  
-  if (currentPosts.length > 0) {
-    status.innerText = `${currentPosts.length} posts captured so far.`;
-    displayPosts(currentPosts);
-  } else {
-    results.innerHTML = `<div class="empty-state"><div class="empty-icon">📥</div><p>No data captured yet.</p></div>`;
-    status.innerText = 'Waiting for Facebook Group...';
-  }
-
-  if (currentGroups.length > 0) {
-    displayGroups(currentGroups, currentPosts);
-  } else {
-    groupResults.innerHTML = `<div class="empty-state"><div class="empty-icon">🔍</div><p>No groups discovered yet.</p></div>`;
+function updateStartButton() {
+  const startBtn = document.getElementById('startAutoCommentBtn');
+  if (startBtn) {
+    const span = startBtn.querySelector('span');
+    if (span) {
+      span.innerText = selectedPosts.size > 0 
+        ? `Start Auto Comment (${selectedPosts.size})` 
+        : 'Start Auto Comment (Select posts first)';
+    }
+    startBtn.disabled = selectedPosts.size === 0;
+    startBtn.style.opacity = selectedPosts.size === 0 ? '0.5' : '1';
   }
 }
 
-btn.addEventListener('click', async () => {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab || !tab.url.includes('facebook.com')) {
-    status.innerText = 'Please navigate to a Facebook page.';
+function updateUI() {
+  if (countBadge) countBadge.innerText = currentPosts.length;
+  if (exportBtn) exportBtn.disabled = currentPosts.length === 0;
+  
+  if (currentPosts.length > 0) {
+    if (status) status.innerText = `${currentPosts.length} posts captured so far.`;
+    displayPosts(currentPosts);
+  } else {
+    if (results) results.innerHTML = `<div class="empty-state"><div class="empty-icon">📥</div><p>No data captured yet.</p></div>`;
+    if (status) status.innerText = 'Waiting for Facebook Group...';
+  }
+
+  if (typeof updateCommentLog === 'function') {
+    updateCommentLog(autoCommentLog);
+  }
+  
+  updateStartButton();
+}
+
+function updateCommentLog(log) {
+  const logContainer = document.getElementById('auto-comment-log');
+  if (!logContainer) return;
+  
+  if (!log || log.length === 0) {
+    logContainer.innerHTML = `<div class="empty-state"><p>Wait for start to see progress log.</p></div>`;
     return;
   }
-  btn.disabled = true;
-  const original = btn.innerHTML;
-  btn.innerHTML = '<span>Extracting...</span>';
   
-  const limitInput = document.getElementById('scrapeLimit');
-  const targetLimit = limitInput.value ? parseInt(limitInput.value) : null;
-  
-  try {
-    const response = await chrome.tabs.sendMessage(tab.id, { 
-      type: 'START_SCRAPE',
-      targetLimit: targetLimit
-    });
-    if (response) {
-      if (response.posts) currentPosts = response.posts;
-      if (response.groups) currentGroups = response.groups;
-      updateUI();
+  logContainer.innerHTML = log.map(entry => `
+    <div class="log-entry">
+      <span class="log-time">${new Date(entry.time).toLocaleTimeString()}</span>
+      <span class="log-msg ${entry.success ? 'log-success' : 'log-error'}">${escapeHtml(entry.msg)}</span>
+    </div>
+  `).join('');
+  logContainer.scrollTop = logContainer.scrollHeight;
+}
+
+if (document.getElementById('autoReplyMode')) {
+  document.getElementById('autoReplyMode').addEventListener('change', (e) => {
+    const kwGroup = document.getElementById('keywordGroup');
+    if (kwGroup) kwGroup.style.display = e.target.checked ? 'flex' : 'none';
+  });
+}
+
+const startAutoCommentBtn = document.getElementById('startAutoCommentBtn');
+if (startAutoCommentBtn) {
+  startAutoCommentBtn.addEventListener('click', () => {
+    const template = document.getElementById('commentTemplate');
+    const delayInput = document.getElementById('commentDelay');
+    const replyMode = document.getElementById('autoReplyMode');
+    const keywordsInput = document.getElementById('replyKeywords');
+    
+    const message = template ? template.value : '';
+    const delay = delayInput ? parseInt(delayInput.value) || 10 : 10;
+    const isReplyMode = replyMode ? replyMode.checked : false;
+    const keywords = keywordsInput ? keywordsInput.value.split(',').map(k => k.trim()).filter(k => k) : [];
+    
+    if (!message) {
+      alert('Please enter a message.');
+      return;
     }
-  } catch (err) {
-    status.innerText = 'Error: Please refresh the page.';
-  } finally {
-    btn.disabled = false;
-    btn.innerHTML = original;
-  }
-});
 
-exportBtn.addEventListener('click', () => {
-  if (currentPosts.length === 0) return;
-  const headers = ['ID', 'Author', 'GroupName', 'GroupID', 'Timestamp', 'Text', 'Likes', 'Comments', 'Shares', 'URL', 'LastUpdated'];
-  const csvRows = [headers.join(',')];
-  currentPosts.forEach(post => {
-    const row = [
-      post.fbid, 
-      `"${escapeCsv(post.author)}"`, 
-      `"${escapeCsv(post.groupName)}"`, 
-      post.groupId, 
-      `"${escapeCsv(post.timestamp)}"`, 
-      `"${escapeCsv(post.text)}"`, 
-      post.likes, 
-      post.comments, 
-      post.shares, 
-      post.postUrl,
-      post.lastUpdated || post.scrapedAt
-    ];
-    csvRows.push(row.join(','));
+    if (isReplyMode && keywords.length === 0) {
+      alert('Please enter at least one keyword for Auto Reply mode.');
+      return;
+    }
+    
+    if (currentPosts.length === 0) {
+      alert('No posts captured yet.');
+      return;
+    }
+    
+    const confirmMsg = isReplyMode 
+      ? `Start auto replying to comments matching [${keywords.join(', ')}] on ${selectedPosts.size} selected posts?`
+      : `Start auto commenting on ${selectedPosts.size} selected posts with ${delay}s delay?`;
+
+    if (confirm(confirmMsg)) {
+      const selectedData = currentPosts.filter(p => selectedPosts.has(String(p.fbid)));
+      
+      chrome.runtime.sendMessage({
+        type: 'START_AUTO_COMMENT',
+        posts: selectedData,
+        message: message,
+        delay: delay,
+        isReplyMode: isReplyMode,
+        keywords: keywords
+      });
+      
+      const startBtn = document.getElementById('startAutoCommentBtn');
+      const stopBtn = document.getElementById('stopAutoCommentBtn');
+      if (startBtn) startBtn.style.display = 'none';
+      if (stopBtn) stopBtn.style.display = 'flex';
+      
+      const commentStatus = document.getElementById('commentStatus');
+      if (commentStatus) commentStatus.innerText = 'Starting...';
+    }
   });
-  downloadCsv(csvRows.join('\n'), `fb-posts-${Date.now()}.csv`);
-});
+}
 
-exportGroupsBtn.addEventListener('click', () => {
-  if (currentGroups.length === 0) return;
-  const headers = ['ID', 'Name', 'URL', 'Members', 'Activity', 'Score'];
-  const csvRows = [headers.join(',')];
-  currentGroups.forEach(group => {
-    const row = [group.id, `"${escapeCsv(group.name)}"`, group.url, group.memberCount, group.postsPerDay, group.score];
-    csvRows.push(row.join(','));
+const stopAutoCommentBtn = document.getElementById('stopAutoCommentBtn');
+if (stopAutoCommentBtn) {
+  stopAutoCommentBtn.addEventListener('click', () => {
+    chrome.runtime.sendMessage({ type: 'STOP_AUTO_COMMENT' });
+    stopAutoCommentBtn.disabled = true;
+    stopAutoCommentBtn.innerText = 'Stopping...';
+    
+    setTimeout(() => {
+      stopAutoCommentBtn.disabled = false;
+      stopAutoCommentBtn.innerText = 'Stop';
+    }, 2000);
   });
-  downloadCsv(csvRows.join('\n'), `fb-discovered-groups-${Date.now()}.csv`);
-});
+}
 
-clearBtn.addEventListener('click', async () => {
-  if (!confirm('Clear all data?')) return;
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (tab) chrome.tabs.sendMessage(tab.id, { type: 'CLEAR_DATA' }).catch(() => {});
-  currentPosts = []; currentGroups = [];
-  chrome.storage.local.set({ fb_intercepted_posts: [], fb_discovered_groups: [] });
-  chrome.runtime.sendMessage({ type: 'UPDATE_BADGE', count: 0 }).catch(() => {});
-  updateUI();
-});
+if (btn) {
+  btn.addEventListener('click', async () => {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || !tab.url.includes('facebook.com')) {
+      if (status) status.innerText = 'Please navigate to a Facebook page.';
+      return;
+    }
+    btn.disabled = true;
+    const original = btn.innerHTML;
+    btn.innerHTML = '<span>Extracting...</span>';
+    
+    const limitInput = document.getElementById('scrapeLimit');
+    const targetLimit = limitInput ? (limitInput.value ? parseInt(limitInput.value) : null) : null;
+    
+    try {
+      const response = await chrome.tabs.sendMessage(tab.id, { 
+        type: 'START_SCRAPE',
+        targetLimit: targetLimit
+      });
+      if (response) {
+        if (response.posts) currentPosts = response.posts;
+        if (response.groups) currentGroups = response.groups;
+        updateUI();
+      }
+    } catch (err) {
+      if (status) status.innerText = 'Error: Please refresh the page.';
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = original;
+    }
+  });
+}
+
+if (exportBtn) {
+  exportBtn.addEventListener('click', () => {
+    if (currentPosts.length === 0) return;
+    const headers = ['ID', 'Author', 'GroupName', 'GroupID', 'Timestamp', 'Text', 'Likes', 'Comments', 'Shares', 'URL', 'LastUpdated'];
+    const csvRows = [headers.join(',')];
+    currentPosts.forEach(post => {
+      const row = [
+        post.fbid, 
+        `"${escapeCsv(post.author)}"`, 
+        `"${escapeCsv(post.groupName)}"`, 
+        post.groupId, 
+        `"${escapeCsv(post.timestamp)}"`, 
+        `"${escapeCsv(post.text)}"`, 
+        post.likes, 
+        post.comments, 
+        post.shares, 
+        post.postUrl,
+        post.lastUpdated || post.scrapedAt
+      ];
+      csvRows.push(row.join(','));
+    });
+    downloadCsv(csvRows.join('\n'), `fb-posts-${Date.now()}.csv`);
+  });
+}
+
+// Group export removed
+
+if (clearBtn) {
+  clearBtn.addEventListener('click', async () => {
+    if (!confirm('Clear all data?')) return;
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab) chrome.tabs.sendMessage(tab.id, { type: 'CLEAR_DATA' }).catch(() => {});
+    currentPosts = [];
+    chrome.storage.local.set({ fb_intercepted_posts: [] });
+    chrome.runtime.sendMessage({ type: 'UPDATE_BADGE', count: 0 }).catch(() => {});
+    updateUI();
+  });
+}
 
 function displayPosts(posts) {
   let filtered = posts.filter(p => 
@@ -188,51 +359,79 @@ function displayPosts(posts) {
       </div>
       <div class="group-section-actions">
         <span class="group-section-count">${grouped[groupName].length} posts</span>
-        <button class="btn-analyze" data-group="${escapeHtml(groupName)}">Analyze</button>
+        <button class="btn-analyze" data-group="${escapeHtml(groupName)}">Analyze Group</button>
       </div>
     `;
     section.appendChild(header);
 
-    // Analysis container
-    const analysisContainer = document.createElement('div');
-    analysisContainer.id = `analysis-${groupName.replace(/\s+/g, '-')}`;
-    section.appendChild(analysisContainer);
+    // Analysis container for group
+    const groupAnalysisContainer = document.createElement('div');
+    groupAnalysisContainer.id = `analysis-${groupName.replace(/\s+/g, '-')}`;
+    section.appendChild(groupAnalysisContainer);
 
     grouped[groupName].forEach(post => {
+      const isSelected = selectedPosts.has(String(post.fbid));
       const postEl = document.createElement('div');
-      postEl.className = 'post';
+      postEl.className = `post ${isSelected ? 'selected' : ''}`;
       
-      // Need a unique ID for the post to target its analysis container
       const safeId = `post-${post.fbid || Math.random().toString(36).substr(2, 9)}`;
       
       postEl.innerHTML = `
-        <div class="post-header"><span class="post-author">${escapeHtml(post.author)}</span><span class="post-time">${escapeHtml(post.timestamp)}</span></div>
-        <div class="post-text">${escapeHtml(post.text)}</div>
-        <div class="post-footer">
-          <div class="post-stats">
-            <div class="stat">❤️ ${formatNumber(post.likes)}</div>
-            <div class="stat">💬 ${formatNumber(post.comments)}</div>
-            <div class="stat">🔁 ${formatNumber(post.shares)}</div>
-          </div>
-          <div class="post-actions">
-            <button class="btn-analyze-post" data-target="${safeId}" style="background: var(--primary); color: white; border: none; padding: 4px 8px; border-radius: 4px; font-size: 0.65rem; cursor: pointer;">Analyze</button>
-            ${post.comments > 0 ? `<button class="btn-deep-comment" data-url="${escapeHtml(post.postUrl)}" data-fbid="${post.fbid}" style="background: #10b981; color: white; border: none; padding: 4px 8px; border-radius: 4px; font-size: 0.65rem; cursor: pointer;">Deep Comment</button>` : ''}
-            <button class="copy-btn" data-text="${escapeHtml(post.text)}">Copy</button>
-            <a href="${escapeHtml(post.postUrl)}" class="view-link" target="_blank">Source</a>
+        <div style="display: flex; gap: 12px; align-items: flex-start;">
+          <input type="checkbox" class="post-checkbox" data-fbid="${post.fbid}" ${isSelected ? 'checked' : ''} style="margin-top: 4px;">
+          <div style="flex: 1;">
+            <div class="post-header">
+              <span class="post-author">${escapeHtml(post.author)}</span>
+              <span class="post-time">${escapeHtml(post.timestamp)}</span>
+            </div>
+            <div class="post-text">${escapeHtml(post.text)}</div>
+            <div class="post-footer">
+              <div class="post-stats">
+                <div class="stat">❤️ ${formatNumber(post.likes)}</div>
+                <div class="stat">💬 ${formatNumber(post.comments)}</div>
+                <div class="stat">🔁 ${formatNumber(post.shares)}</div>
+              </div>
+              <div class="post-actions">
+                <button class="btn-analyze-post" data-target="${safeId}" style="background: var(--primary); color: white; border: none; padding: 4px 8px; border-radius: 4px; font-size: 0.65rem; cursor: pointer;">Analyze</button>
+                ${post.comments > 0 ? `<button class="btn-deep-comment" data-url="${escapeHtml(post.postUrl)}" data-fbid="${post.fbid}" style="background: #10b981; color: white; border: none; padding: 4px 8px; border-radius: 4px; font-size: 0.65rem; cursor: pointer;">Deep Comment</button>` : ''}
+                <button class="copy-btn" data-text="${escapeHtml(post.text)}">Copy</button>
+                <a href="${escapeHtml(post.postUrl)}" class="view-link" target="_blank">Source</a>
+              </div>
+            </div>
+            <div id="analysis-${safeId}" style="display: none; margin-top: 10px; padding-top: 10px; border-top: 1px dashed rgba(255,255,255,0.1);"></div>
           </div>
         </div>
-        <div id="analysis-${safeId}" style="display: none; margin-top: 10px; padding-top: 10px; border-top: 1px dashed rgba(255,255,255,0.1);"></div>
       `;
-      section.appendChild(postEl);
       
-      // Store post data temporarily on the element for easy access
-      postEl.dataset.postText = post.text;
+      // Store post data temporarily
       postEl.dataset.commentsText = post.commentsText || '';
+      
+      // Selection handler
+      const checkbox = postEl.querySelector('.post-checkbox');
+      checkbox.addEventListener('change', (e) => {
+        if (e.target.checked) {
+          selectedPosts.add(String(post.fbid));
+          postEl.classList.add('selected');
+        } else {
+          selectedPosts.delete(String(post.fbid));
+          postEl.classList.remove('selected');
+          const sa = document.getElementById('selectAllPosts');
+          if (sa) sa.checked = false;
+        }
+        updateStartButton();
+      });
+
+      section.appendChild(postEl);
     });
     
     results.appendChild(section);
   });
 
+  // Re-attach event listeners
+  attachPostEventListeners();
+}
+
+function attachPostEventListeners() {
   // Add Copy Event Listeners
   document.querySelectorAll('.copy-btn').forEach(btn => {
     btn.addEventListener('click', (e) => {
@@ -250,8 +449,6 @@ function displayPosts(posts) {
     btn.addEventListener('click', (e) => {
       const targetId = e.target.dataset.target;
       const container = document.getElementById(`analysis-${targetId}`);
-      
-      // Focus strictly on audience insights (comments)
       const commentsText = e.target.closest('.post').dataset.commentsText || '';
       
       if (container.style.display === 'block') {
@@ -282,30 +479,17 @@ function displayPosts(posts) {
     btn.addEventListener('click', (e) => {
       const url = e.target.dataset.url;
       const fbid = e.target.dataset.fbid;
-      
-      if (!url) {
-        alert("Cannot find source URL for this post.");
-        return;
-      }
-
-      const originalText = e.target.innerText;
-      e.target.innerText = 'Scraping...';
-      e.target.style.opacity = '0.7';
-      e.target.disabled = true;
+      const targetBtn = e.target;
+      targetBtn.innerText = 'Initializing...';
+      targetBtn.style.opacity = '0.7';
+      targetBtn.disabled = true;
+      targetBtn.id = `active-scraping-${fbid}`;
 
       chrome.runtime.sendMessage({
         type: 'START_DEEP_SCRAPE',
         url: url,
         fbid: fbid
       });
-
-      // Reset button after 15 seconds (assumed completion time or timeout)
-      setTimeout(() => {
-        e.target.innerText = 'Done! Click Analyze';
-        e.target.style.background = '#3b82f6';
-        e.target.style.opacity = '1';
-        e.target.disabled = false;
-      }, 15000);
     });
   });
 
@@ -313,7 +497,8 @@ function displayPosts(posts) {
   document.querySelectorAll('.btn-analyze').forEach(btn => {
     btn.addEventListener('click', (e) => {
       const gName = e.target.dataset.group;
-      runAnalysis(gName, grouped[gName]);
+      const filtered = currentPosts.filter(p => (p.groupName || 'Unknown Group') === gName);
+      runAnalysis(gName, filtered);
     });
   });
 }
@@ -395,43 +580,7 @@ function runAnalysis(groupName, posts) {
 }
 
 
-function displayGroups(groups, allPosts = []) {
-  const sorted = [...groups].sort((a, b) => {
-    const map = { 'High Potential': 4, 'Medium Potential': 3, 'Low': 2, '⭐ Linked from Post': 1 };
-    const scoreA = map[a.score] || 0;
-    const scoreB = map[b.score] || 0;
-    return scoreB - scoreA;
-  });
-
-  groupResults.innerHTML = '';
-  sorted.forEach(group => {
-    // Calculate stats for this group if it has posts
-    const groupPosts = allPosts.filter(p => String(p.groupId) === String(group.id) || p.groupName === group.name);
-    const totalEngagement = groupPosts.reduce((sum, p) => sum + (p.likes || 0) + (p.comments || 0), 0);
-    
-    const isLinked = group.score.includes('Linked');
-    
-    const el = document.createElement('div');
-    el.className = 'group-card';
-    el.innerHTML = `
-      <div class="group-info">
-        <span class="group-name">${escapeHtml(group.name)}</span>
-        <span class="potential-badge" style="background: ${group.scoreColor}22; color: ${group.scoreColor}">${group.score}</span>
-      </div>
-      <div class="group-meta">
-        ${isLinked ? `
-          <span>Captured: <span class="meta-val">${groupPosts.length} posts</span></span>
-          <span>Engagement: <span class="meta-val">🔥 ${formatNumber(totalEngagement)}</span></span>
-        ` : `
-          <span>Members: <span class="meta-val">${formatNumber(group.memberCount)}</span></span>
-          <span>Activity: <span class="meta-val">${group.postsPerDay} posts/day</span></span>
-        `}
-      </div>
-      <div class="group-actions"><a href="${group.url}" target="_blank" class="btn-visit">Visit Group</a></div>
-    `;
-    groupResults.appendChild(el);
-  });
-}
+// Group display functions removed
 
 function downloadCsv(csv, filename) {
   const blob = new Blob([csv], { type: 'text/csv' });

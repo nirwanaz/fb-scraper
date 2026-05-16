@@ -1,0 +1,8 @@
+# Sample/reference files (terlalu besar & hanya untuk dev)
+sample-dom.html
+sample-response-*.txt
+dialog-comment.html
+
+# OS files
+.DS_Store
+Thumbs.db
