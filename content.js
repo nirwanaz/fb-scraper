@@ -1,5 +1,13 @@
-// Global storage for intercepted posts
-let interceptedPosts = [];
+(function() {
+  if (window.hasFBScraperScriptInjected) {
+    console.log('[FB Scraper] Content script already active on this page. Avoiding double injection.');
+    return;
+  }
+  window.hasFBScraperScriptInjected = true;
+
+  // Global storage for intercepted posts
+  let interceptedPosts = [];
+  let discoveredGroups = [];
 
 // Load existing data from storage on init
 chrome.storage.local.get(['fb_intercepted_posts'], (result) => {
@@ -20,11 +28,22 @@ function injectScript() {
 
 injectScript();
 
+function safeSendMessage(message) {
+  try {
+    if (chrome.runtime && chrome.runtime.sendMessage) {
+      const p = chrome.runtime.sendMessage(message);
+      if (p && typeof p.catch === 'function') {
+        p.catch(() => {});
+      }
+    }
+  } catch (e) {
+    console.warn('[FB Scraper] safeSendMessage error:', e.message);
+  }
+}
+
 // Helper to update badge (shows sum of posts and new groups)
 function updateBadge(count) {
-  if (chrome.runtime && chrome.runtime.sendMessage) {
-    chrome.runtime.sendMessage({ type: 'UPDATE_BADGE', count: count }).catch(() => {});
-  }
+  safeSendMessage({ type: 'UPDATE_BADGE', count: count });
 }
 
 // --- Lexical Editor Helpers for Auto Comment ---
@@ -46,50 +65,56 @@ async function insertTextIntoLexical(editor, text) {
   document.execCommand('delete', false, null);
   await new Promise(r => setTimeout(r, 200));
   
-  // Step 2: Insert text via execCommand (generates trusted events)
-  const inserted = document.execCommand('insertText', false, text);
-  console.log('[FB Scraper] execCommand insertText result:', inserted);
+  // Step 2: Try Clipboard Paste simulation first, as it preserves newlines and formatting natively in Lexical
+  console.log('[FB Scraper] Simulating clipboard paste to preserve paragraphs...');
+  editor.focus();
+  const dt = new DataTransfer();
+  dt.setData('text/plain', text);
+  const pasteEvent = new ClipboardEvent('paste', {
+    bubbles: true,
+    cancelable: true,
+    clipboardData: dt
+  });
+  editor.dispatchEvent(pasteEvent);
   
   await new Promise(r => setTimeout(r, 500));
   
-  // Step 3: Verify
-  const content = (editor.innerText || editor.textContent || '').trim();
-  console.log('[FB Scraper] Editor content after insert:', content.substring(0, 80));
+  // Step 3: Verify if paste was successful
+  let content = (editor.innerText || editor.textContent || '').trim();
+  console.log('[FB Scraper] Editor content after paste:', content.substring(0, 80));
   
+  // Step 4: Fallback to execCommand line-by-line if paste failed
   if (content.length === 0) {
-    console.warn('[FB Scraper] execCommand failed, trying clipboard paste...');
-    
-    // Fallback: Simulate paste via DataTransfer
-    editor.focus();
-    const dt = new DataTransfer();
-    dt.setData('text/plain', text);
-    const pasteEvent = new ClipboardEvent('paste', {
-      bubbles: true,
-      cancelable: true,
-      clipboardData: dt
-    });
-    editor.dispatchEvent(pasteEvent);
-    
-    await new Promise(r => setTimeout(r, 500));
-    const content2 = (editor.innerText || editor.textContent || '').trim();
-    console.log('[FB Scraper] Editor content after paste:', content2.substring(0, 80));
-    
-    if (content2.length === 0) {
-      console.warn('[FB Scraper] Paste also failed, trying direct DOM + input event...');
-      
-      // Last resort: Direct DOM manipulation
-      let p = editor.querySelector('p');
-      if (p) {
-        p.textContent = text;
-      } else {
-        editor.textContent = text;
+    console.warn('[FB Scraper] Paste failed, trying execCommand...');
+    const lines = text.split('\n');
+    let inserted = true;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i]) {
+        inserted = inserted && document.execCommand('insertText', false, lines[i]);
       }
-      
-      // Dispatch input events
-      editor.dispatchEvent(new InputEvent('input', {
-        bubbles: true, inputType: 'insertText', data: text
-      }));
+      if (i < lines.length - 1) {
+        inserted = inserted && document.execCommand('insertLineBreak');
+      }
     }
+    await new Promise(r => setTimeout(r, 500));
+    content = (editor.innerText || editor.textContent || '').trim();
+    console.log('[FB Scraper] Editor content after execCommand:', content.substring(0, 80));
+  }
+  
+  // Step 5: Last resort - Direct DOM manipulation
+  if (content.length === 0) {
+    console.warn('[FB Scraper] Both paste and execCommand failed, trying direct DOM + input event...');
+    let p = editor.querySelector('p');
+    if (p) {
+      p.textContent = text;
+    } else {
+      editor.textContent = text;
+    }
+    
+    // Dispatch input event to notify editor framework
+    editor.dispatchEvent(new InputEvent('input', {
+      bubbles: true, inputType: 'insertText', data: text
+    }));
   }
   
   return content.length > 0;
@@ -148,7 +173,7 @@ let isDeepScraping = false;
 let deepScrapeFbid = null;
 let deepScrapeClickCount = 0;
 let deepScrapeEmptyRetries = 0;
-const MAX_DEEP_CLICKS = 30;
+const MAX_DEEP_CLICKS = 9999; // Set to very high to scrape all comments
 const MAX_EMPTY_RETRIES = 10;
 
 chrome.storage.local.get(['pending_deep_scrape'], (result) => {
@@ -181,21 +206,21 @@ function startDeepAutoClicker() {
   
   console.log(`[FB Scraper] Running Auto-Clicker Loop. Clicks: ${deepScrapeClickCount}, Retries: ${deepScrapeEmptyRetries}`);
 
-  // 1. Smarter Scrolling (Find the actual scroll container)
-  const dialog = document.querySelector('[role="dialog"]');
-  if (dialog) {
-    // Find the child element that actually has the scrollbar
-    const scrollableElement = Array.from(dialog.querySelectorAll('*')).find(el => {
-      const style = window.getComputedStyle(el);
-      return (el.scrollHeight > el.clientHeight) && (style.overflowY === 'auto' || style.overflowY === 'scroll');
+  // 1. Robust Scrolling (Find and scroll any large scrollable container, e.g. modal dialogs)
+  const scrollableElements = Array.from(document.querySelectorAll('*')).filter(el => {
+    // Find elements that are scrollable (have more content than height) and are reasonably large
+    return el.scrollHeight > el.clientHeight + 50 && el.clientHeight > 200;
+  });
+  
+  if (scrollableElements.length > 0) {
+    scrollableElements.forEach(el => {
+      el.scrollTop = el.scrollHeight;
+      el.dispatchEvent(new Event('scroll'));
     });
-    
-    const target = scrollableElement || dialog;
-    console.log('[FB Scraper] Scrolling container...');
-    target.scrollTop = target.scrollHeight; // Scroll to absolute bottom
-  } else {
-    window.scrollTo(0, document.body.scrollHeight);
   }
+  
+  // Fallback to window scroll
+  window.scrollTo(0, document.body.scrollHeight);
 
   // 2. Handle "Most Relevant" dropdown (Improved with Polling)
   if (deepScrapeClickCount < 3) {
@@ -245,6 +270,10 @@ function startDeepAutoClicker() {
                        text.includes('like') || text.includes('suka') ||
                        text.includes('paling relevan') || text.includes('most relevant');
     
+    // Ignore buttons that have been clicked repeatedly without disappearing
+    const clickCount = parseInt(btn.getAttribute('data-scraped-clicks') || '0');
+    if (clickCount >= 3) return false;
+    
     return (isMatch || (hasNumbers && (text.includes('reply') || text.includes('balasan')))) && !isExcluded;
   });
 
@@ -257,6 +286,10 @@ function startDeepAutoClicker() {
     // Pick the last button (often the most bottom "view more" or "replies")
     const targetButton = buttons[buttons.length - 1];
     console.log(`[FB Scraper] Clicking button: "${(targetButton.innerText || targetButton.getAttribute('aria-label') || 'unnamed').substring(0, 40)}..."`);
+    
+    // Increment click counter on this specific button to prevent infinite loops if broken
+    const currentClicks = parseInt(targetButton.getAttribute('data-scraped-clicks') || '0');
+    targetButton.setAttribute('data-scraped-clicks', currentClicks + 1);
     
     targetButton.scrollIntoView({ behavior: 'smooth', block: 'center' });
     
@@ -273,7 +306,7 @@ function startDeepAutoClicker() {
     } else {
       console.log('[FB Scraper] Deep Scrape Completed (Limit or End reached).');
       isDeepScraping = false;
-      chrome.runtime.sendMessage({ type: 'DEEP_SCRAPE_COMPLETE' }).catch(() => {});
+      safeSendMessage({ type: 'DEEP_SCRAPE_COMPLETE' });
     }
   }
 }
@@ -371,11 +404,11 @@ window.addEventListener('message', (event) => {
                 console.log(`[FB Scraper] Deep Scrape: Added ${addedCount} new comments.`);
                 
                 // Notify popup of the update
-                chrome.runtime.sendMessage({ 
+                safeSendMessage({ 
                   type: 'DATA_UPDATED', 
                   posts: posts,
                   groups: groupsResult.fb_discovered_groups || []
-                }).catch(() => {});
+                });
               });
             });
           }
@@ -428,17 +461,168 @@ window.addEventListener('message', (event) => {
     });
     updateBadge(interceptedPosts.length);
 
-    chrome.runtime.sendMessage({ 
+    safeSendMessage({ 
       type: 'DATA_UPDATED', 
       posts: interceptedPosts
-    }).catch(() => {});
+    });
   }
 });
 
+// --- Auto Post Group Helpers ---
 
+function findPostTrigger() {
+  const keywords = [
+    'write something', 'tulis sesuatu', 'create a public post', 
+    'buat postingan publik', 'what\'s on your mind', 'apa yang anda pikirkan',
+    'buat postingan', 'write something...'
+  ];
+  
+  // Search elements with role="button" first
+  const buttons = Array.from(document.querySelectorAll('[role="button"], [role="link"], [role="presentation"]'));
+  for (const btn of buttons) {
+    const text = (btn.innerText || '').toLowerCase().trim();
+    if (keywords.some(kw => text.includes(kw))) {
+      console.log('[FB Scraper] Found trigger by role button/link:', text);
+      return btn;
+    }
+  }
+  
+  // Fallback: search all spans or divs containing these keywords
+  const elements = Array.from(document.querySelectorAll('span, div'));
+  for (const el of elements) {
+    if (el.children.length === 0) { // leaf elements
+      const text = (el.innerText || el.textContent || '').toLowerCase().trim();
+      if (keywords.some(kw => text === kw || text === kw + '...')) {
+        let clickable = el;
+        while (clickable && clickable !== document.body) {
+          const role = clickable.getAttribute('role');
+          if (role === 'button' || clickable.tagName === 'BUTTON') {
+            console.log('[FB Scraper] Found trigger ancestor:', role || clickable.tagName);
+            return clickable;
+          }
+          clickable = clickable.parentElement;
+        }
+        console.log('[FB Scraper] Found trigger leaf:', text);
+        return el;
+      }
+    }
+  }
+  return null;
+}
+
+function findPostEditor() {
+  // Check inside active dialogs first
+  const dialogs = Array.from(document.querySelectorAll('[role="dialog"]'));
+  for (const dialog of dialogs) {
+    let editor = dialog.querySelector('div[contenteditable="true"][data-lexical-editor="true"]');
+    if (!editor) editor = dialog.querySelector('div[contenteditable="true"][role="textbox"]');
+    if (!editor) editor = dialog.querySelector('div[contenteditable="true"]');
+    if (editor) {
+      console.log('[FB Scraper] Found editor inside active dialog');
+      return editor;
+    }
+  }
+  
+  // Fallback: check globally
+  let editor = document.querySelector('div[contenteditable="true"][data-lexical-editor="true"]');
+  if (!editor) editor = document.querySelector('div[contenteditable="true"][role="textbox"]');
+  if (!editor) {
+    editor = Array.from(document.querySelectorAll('div[contenteditable="true"]')).find(el => el.offsetParent !== null);
+  }
+  if (editor) {
+    console.log('[FB Scraper] Found editor globally');
+  }
+  return editor;
+}
+
+function findPostButton() {
+  const dialogs = Array.from(document.querySelectorAll('[role="dialog"]'));
+  const keywords = ['post', 'posting', 'kirim', 'publish', 'bagikan', 'share'];
+  
+  for (const dialog of dialogs) {
+    // Search all buttons or divs with role="button" inside the dialog
+    const buttons = Array.from(dialog.querySelectorAll('[role="button"], button, [type="submit"]'));
+    for (const btn of buttons) {
+      const text = (btn.innerText || '').toLowerCase().trim();
+      if (keywords.includes(text)) {
+        console.log('[FB Scraper] Found post button inside dialog:', text);
+        return btn;
+      }
+    }
+  }
+  
+  // Fallback: check globally
+  const buttons = Array.from(document.querySelectorAll('[role="button"], button'));
+  for (const btn of buttons) {
+    const text = (btn.innerText || '').toLowerCase().trim();
+    if (keywords.includes(text) && btn.offsetParent !== null) {
+      console.log('[FB Scraper] Found post button globally:', text);
+      return btn;
+    }
+  }
+  
+  return null;
+}
+
+function clickElement(el) {
+  if (!el) return;
+  console.log('[FB Scraper] Clicking element:', el.tagName || el.getAttribute('role'));
+  el.focus();
+  
+  // Single click is sufficient and prevents double submissions
+  el.click();
+}
 
 // Listener for popup messages
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === 'PERFORM_POST') {
+    (async () => {
+      try {
+        console.log('[FB Scraper] Performing auto-post...');
+        
+        // Step 1: Find post trigger
+        const trigger = findPostTrigger();
+        if (!trigger) {
+          sendResponse({ success: false, error: 'Could not find "Write something..." trigger box on page' });
+          return;
+        }
+
+        // Step 2: Click trigger to open editor dialog
+        clickElement(trigger);
+        await new Promise(r => setTimeout(r, 3000));
+
+        // Step 3: Find the editor
+        const editor = findPostEditor();
+        if (!editor) {
+          sendResponse({ success: false, error: 'Could not find editor box after clicking trigger' });
+          return;
+        }
+
+        // Step 4: Fill editor with message
+        await insertTextIntoLexical(editor, msg.message);
+        await new Promise(r => setTimeout(r, 2000)); // wait for button to become active
+
+        // Step 5: Find post button
+        const postBtn = findPostButton();
+        if (!postBtn) {
+          sendResponse({ success: false, error: 'Could not find "Post" or "Posting" button' });
+          return;
+        }
+
+        // Step 6: Click post button
+        clickElement(postBtn);
+        await new Promise(r => setTimeout(r, 4000)); // wait for upload/submit
+        
+        sendResponse({ success: true });
+
+      } catch (err) {
+        console.error('[FB Scraper] Auto Post Error:', err);
+        sendResponse({ success: false, error: err.message });
+      }
+    })();
+    return true; // Keep message channel open
+  }
+
   if (msg.type === 'PERFORM_COMMENT') {
     (async () => {
       try {
@@ -447,28 +631,38 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (msg.isReplyMode && msg.keywords) {
           // --- AUTO REPLY LOGIC ---
           const keywords = msg.keywords.map(k => k.toLowerCase());
-          const commentElements = Array.from(document.querySelectorAll('[role="article"][aria-label^="Comment by"]'));
+          // Fix: Find all "Reply" buttons first, then check their container for keywords.
+          // Facebook's DOM changes often, and role="article" is not always used (especially in dialogs).
+          const replyButtons = Array.from(document.querySelectorAll('[role="button"], [role="link"], a')).filter(b => {
+            const t = (b.innerText || '').toLowerCase().trim();
+            return t === 'reply' || t === 'balas' || t === 'jawab' || t === 'balasan';
+          });
           
           let repliesCount = 0;
-          for (const el of commentElements) {
-            const text = (el.innerText || '').toLowerCase();
-            const hasKeyword = keywords.some(k => text.includes(k));
+          for (const replyBtn of replyButtons) {
+            // Traverse up to find the comment container (approx 6-10 levels up)
+            let container = replyBtn;
+            for(let i=0; i<8; i++) {
+              if (container.parentElement) container = container.parentElement;
+            }
+            
+            const text = (container.innerText || '').toLowerCase();
+            const hasKeyword = keywords.some(k => text.includes(k.toLowerCase()));
             
             if (hasKeyword) {
-              // Find "Reply" button
-              const replyBtn = Array.from(el.querySelectorAll('[role="button"]')).find(b => {
-                const t = (b.innerText || '').toLowerCase().trim();
-                return t === 'reply' || t === 'balas' || t === 'jawab' || t === 'balasan';
-              });
-              
+              console.log('[FB Scraper] Found matching comment for reply.');
               if (replyBtn) {
                 replyBtn.click();
                 await new Promise(r => setTimeout(r, 2500));
                 
                 // Find the Lexical reply editor that appeared
-                let replyBox = el.querySelector('div[contenteditable="true"][data-lexical-editor="true"]');
+                let replyBox = container.querySelector('div[contenteditable="true"][data-lexical-editor="true"]');
                 if (!replyBox) {
-                  replyBox = el.querySelector('div[contenteditable="true"][role="textbox"]');
+                  replyBox = container.querySelector('div[contenteditable="true"][role="textbox"]');
+                }
+                if (!replyBox) {
+                  // Try document-wide as fallback, sometimes reply box is appended elsewhere
+                  replyBox = document.querySelector('div[contenteditable="true"][data-lexical-editor="true"]:focus');
                 }
                 if (!replyBox) {
                   // Check active element
@@ -849,6 +1043,7 @@ function extractPostFromStory(story) {
       text: text.substring(0, 5000), // Main post text
       commentsText: commentsText.substring(0, 10000), // Extracted comments text
       timestamp: timestamp || 'Baru saja',
+      createdAt: creationTime || (Date.now() / 1000), // Raw timestamp for sorting
       postUrl,
       likes,
       comments,
@@ -867,12 +1062,41 @@ function autoScroll(targetLimit, callback) {
   // Increase default depth to capture more posts
   let maxAttempts = targetLimit ? Math.max(30, Math.ceil(targetLimit / 2)) : 15; 
   let initialPosts = interceptedPosts.length;
+  
+  let lastTotalScrollHeight = 0;
+  let unchangedScrollCount = 0;
 
   const interval = setInterval(() => {
+    // Robust scrolling: scroll window and any large scrollable containers (like dialogs)
     window.scrollBy(0, 1500);
+    
+    let currentTotalScrollHeight = document.body.scrollHeight;
+    const scrollableElements = Array.from(document.querySelectorAll('*')).filter(el => {
+      return el.scrollHeight > el.clientHeight + 50 && el.clientHeight > 200;
+    });
+    scrollableElements.forEach(el => {
+      el.scrollBy(0, 1500);
+      el.dispatchEvent(new Event('scroll'));
+      currentTotalScrollHeight += el.scrollHeight;
+    });
+    
     scrollAttempts++;
     
     const currentCount = interceptedPosts.length;
+    
+    // Stop condition: Hit the absolute bottom (scroll height hasn't changed for 4 attempts)
+    if (currentTotalScrollHeight === lastTotalScrollHeight) {
+      unchangedScrollCount++;
+      if (unchangedScrollCount >= 4) {
+        console.log('[FB Scraper] Hit the bottom of the page, stopping scroll early.');
+        clearInterval(interval);
+        if(callback) callback();
+        return;
+      }
+    } else {
+      lastTotalScrollHeight = currentTotalScrollHeight;
+      unchangedScrollCount = 0;
+    }
     
     // Stop condition: Limit reached
     if (targetLimit && currentCount >= initialPosts + targetLimit) {
@@ -889,3 +1113,4 @@ function autoScroll(targetLimit, callback) {
     }
   }, 1500);
 }
+})();

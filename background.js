@@ -1,4 +1,16 @@
 let isAutoCommentCancelled = false;
+let isAutoPostCancelled = false;
+
+function safeSendMessage(message) {
+  try {
+    const p = chrome.runtime.sendMessage(message);
+    if (p && typeof p.catch === 'function') {
+      p.catch(() => {});
+    }
+  } catch (e) {
+    console.warn('[FB Scraper] safeSendMessage error:', e.message);
+  }
+}
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'UPDATE_BADGE') {
@@ -15,7 +27,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return;
   }
 
+  if (msg.type === 'STOP_AUTO_POST') {
+    isAutoPostCancelled = true;
+    console.log('[FB Scraper] Stop requested for Auto Post');
+    return;
+  }
+
   if (msg.type === 'START_AUTO_COMMENT') {
+    sendResponse({ success: true });
     const { posts, message, delay } = msg;
     isAutoCommentCancelled = false;
     let log = [];
@@ -24,7 +43,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const updateLog = (m, success = true) => {
       log.push({ time: Date.now(), msg: m, success });
       chrome.storage.local.set({ fb_auto_comment_log: log });
-      chrome.runtime.sendMessage({ 
+      safeSendMessage({ 
         type: 'AUTO_COMMENT_PROGRESS', 
         log, 
         status: `Processing ${completedCount}/${posts.length}` 
@@ -39,7 +58,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         
         if (isAutoCommentCancelled) {
           updateLog('Auto-comment process cancelled by user.', false);
-          chrome.runtime.sendMessage({ type: 'AUTO_COMMENT_PROGRESS', log, status: 'Cancelled' });
+          safeSendMessage({ type: 'AUTO_COMMENT_PROGRESS', log, status: 'Cancelled' });
           return;
         }
 
@@ -71,7 +90,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (isAutoCommentCancelled) {
             chrome.tabs.remove(tab.id);
             updateLog('Auto-comment process cancelled by user.', false);
-            chrome.runtime.sendMessage({ type: 'AUTO_COMMENT_PROGRESS', log, status: 'Cancelled' });
+            safeSendMessage({ type: 'AUTO_COMMENT_PROGRESS', log, status: 'Cancelled' });
             return;
           }
 
@@ -93,7 +112,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (isAutoCommentCancelled) {
             chrome.tabs.remove(tab.id);
             updateLog('Auto-comment process cancelled by user.', false);
-            chrome.runtime.sendMessage({ type: 'AUTO_COMMENT_PROGRESS', log, status: 'Cancelled' });
+            safeSendMessage({ type: 'AUTO_COMMENT_PROGRESS', log, status: 'Cancelled' });
             return;
           }
 
@@ -168,7 +187,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           for (let w = 0; w < waitTime; w++) {
             if (isAutoCommentCancelled) {
               updateLog('Auto-comment process cancelled by user.', false);
-              chrome.runtime.sendMessage({ type: 'AUTO_COMMENT_PROGRESS', log, status: 'Cancelled' });
+              safeSendMessage({ type: 'AUTO_COMMENT_PROGRESS', log, status: 'Cancelled' });
               return;
             }
             await new Promise(r => setTimeout(r, 1000));
@@ -177,7 +196,128 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       
       updateLog('Auto-comment process completed.');
-      chrome.runtime.sendMessage({ type: 'AUTO_COMMENT_PROGRESS', log, status: 'Completed' });
+      safeSendMessage({ type: 'AUTO_COMMENT_PROGRESS', log, status: 'Completed' });
+    })();
+  }
+
+  if (msg.type === 'START_AUTO_POST') {
+    sendResponse({ success: true });
+    const { groups: rawGroups, message, delay } = msg;
+    
+    // Deduplicate groups by ID to prevent double posting to the same group
+    const groups = [];
+    const seenGroupIds = new Set();
+    if (Array.isArray(rawGroups)) {
+      rawGroups.forEach(g => {
+        const gid = String(g.id);
+        if (!seenGroupIds.has(gid)) {
+          seenGroupIds.add(gid);
+          groups.push(g);
+        }
+      });
+    }
+
+    isAutoPostCancelled = false;
+    let log = [];
+    let completedCount = 0;
+    
+    const updateLog = (m, success = true) => {
+      log.push({ time: Date.now(), msg: m, success });
+      chrome.storage.local.set({ fb_auto_post_log: log });
+      safeSendMessage({ 
+        type: 'AUTO_POST_PROGRESS', 
+        log, 
+        status: `Processing ${completedCount}/${groups.length}` 
+      });
+    };
+
+    (async () => {
+      updateLog(`Starting auto-post on ${groups.length} groups...`);
+      
+      for (let i = 0; i < groups.length; i++) {
+        completedCount = i + 1;
+        
+        if (isAutoPostCancelled) {
+          updateLog('Auto-post process cancelled by user.', false);
+          safeSendMessage({ type: 'AUTO_POST_PROGRESS', log, status: 'Cancelled' });
+          return;
+        }
+
+        const group = groups[i];
+        updateLog(`[${completedCount}/${groups.length}] Navigating to group "${group.name}"...`);
+        
+        try {
+          const tab = await new Promise((resolve, reject) => {
+            chrome.tabs.create({ url: group.url, active: false }, (t) => {
+              if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+              else resolve(t);
+            });
+          });
+
+          // Wait for tab to load
+          await new Promise((resolve) => {
+            const listener = (tabId, changeInfo) => {
+              if (tabId === tab.id && changeInfo.status === 'complete') {
+                chrome.tabs.onUpdated.removeListener(listener);
+                resolve();
+              }
+            };
+            chrome.tabs.onUpdated.addListener(listener);
+          });
+
+          // Give it a moment to stabilize
+          await new Promise(r => setTimeout(r, 4000));
+
+          if (isAutoPostCancelled) {
+            chrome.tabs.remove(tab.id);
+            updateLog('Auto-post process cancelled by user.', false);
+            safeSendMessage({ type: 'AUTO_POST_PROGRESS', log, status: 'Cancelled' });
+            return;
+          }
+
+          updateLog(`Creating post on group: "${group.name}"...`);
+
+          // Send post message
+          const response = await new Promise((resolve) => {
+            chrome.tabs.sendMessage(tab.id, { 
+              type: 'PERFORM_POST', 
+              message: message
+            }, (res) => {
+              resolve(res || { success: false, error: 'No response from tab' });
+            });
+          });
+
+          if (response.success) {
+            updateLog(`Success: Posted to group "${group.name}"`);
+          } else {
+            updateLog(`Failed on group "${group.name}": ${response.error}`, false);
+          }
+
+          // Wait a bit then close tab
+          await new Promise(r => setTimeout(r, 2000));
+          chrome.tabs.remove(tab.id);
+
+        } catch (err) {
+          updateLog(`Error processing group "${group.name}": ${err.message}`, false);
+        }
+
+        if (i < groups.length - 1) {
+          const waitTime = delay + Math.floor(Math.random() * 5);
+          updateLog(`Waiting ${waitTime}s before next group...`);
+          
+          for (let w = 0; w < waitTime; w++) {
+            if (isAutoPostCancelled) {
+              updateLog('Auto-post process cancelled by user.', false);
+              safeSendMessage({ type: 'AUTO_POST_PROGRESS', log, status: 'Cancelled' });
+              return;
+            }
+            await new Promise(r => setTimeout(r, 1000));
+          }
+        }
+      }
+      
+      updateLog('Auto-post process completed.');
+      safeSendMessage({ type: 'AUTO_POST_PROGRESS', log, status: 'Completed' });
     })();
   }
 
